@@ -1,4 +1,4 @@
-# Bakersfield Rental Investment Decision Model — Build Plan
+# Bakersfield Rental Investment Decision Model — Build Plan (v2)
 
 ## Purpose (read this first)
 
@@ -10,147 +10,107 @@ This is a personal quantitative decision-support tool for buy-and-hold rental in
 
 Everything below follows from that framing. Favor auditable, explainable math over sophisticated-but-opaque methods. Build incrementally — a working simple version beats a stalled complex one.
 
----
-
-## STOP — First actions before any simulation code is written
-
-Claude Code should do these two things first, in order, before writing any modeling code:
-
-### 1. Ask the user for their RentCast API key
-
-Do not proceed to Phase 1 until this is done. Prompt the user directly:
-
-> "Before I build anything, please paste your RentCast API key. I'll store it in a local `.env` file that's excluded from git — it will never be committed or hardcoded into source files."
-
-Store it as `RENTCAST_API_KEY` in a `.env` file at the project root. Add `.env` to `.gitignore` immediately, before the `.env` file itself is created, so there's no window where it could be accidentally committed. Use `python-dotenv` to load it at runtime. Never print the key to logs or commit history.
-
-### 2. Set up git and a private GitHub repository under the UniversalDreams account
-
-- Initialize a git repo locally.
-- Create a **private** repository under the user's GitHub account/org `UniversalDreams`. Confirm the GitHub CLI (`gh`) is authenticated first (`gh auth status`); if not, prompt the user to run `gh auth login` before proceeding.
-- Suggested repo name: `bakersfield-reia` (Real Estate Investment Analyzer) — adjust if the user prefers something else.
-- Add a `.gitignore` covering `.env`, `__pycache__/`, `*.pyc`, `.venv/`, and any local data cache directories before the first commit.
-- First commit: repo scaffold + this plan file (`PROJECT_PLAN.md`) + `.gitignore` + empty `.env.example` (a template showing `RENTCAST_API_KEY=` with no real value, safe to commit).
-- Push to the private remote.
-
-Only after both of these are done should Phase 1 begin.
+**Financing constraint (fixed):** non-owner-occupied only. All financing logic assumes DSCR or conventional investment loans (20-25%+ down), never FHA/owner-occupant.
 
 ---
 
-## Tech stack
+## STATUS SUMMARY (read before doing anything)
 
-- **Python 3.11+**
-- `numpy`, `scipy` — simulation and stats
-- `pandas` — data handling
-- `requests` — RentCast API calls
-- `python-dotenv` — secrets management
-- `matplotlib` or `plotly` — output distributions/visualization
-- `pytest` — testing, especially for the ablation harness (below)
-- No ML framework needed yet — nothing in this project currently requires PyTorch/TensorFlow. Don't add one preemptively.
+**Completed and validated:** Phase 0 (repo/env setup), Phase 1 (walking skeleton), Phase 1c (leverage threshold function + market screen + rate/IO sensitivity), and a sourcing-landscape research pass. Headline finding, confirmed across 27 verifiable properties in 8 Kern County ZIPs:
 
-## Repository structure
+> **At current ~7.0% investment financing, Bakersfield SFR and small multifamily systemically fail to cash-flow on standard 25-35% down leverage.** Cap rates (~4-5%) sit well below the mortgage constant (~8% fully amortizing). Interest-only structuring helps but only gets 2/27 properties to clear ≤35% down. The gap doesn't meaningfully close until financing rates fall ~150-200bps, and even at 5.0% only ~15% of listed inventory clears 35% down.
 
-```
-bakersfield-reia/
-├── .env                    # RENTCAST_API_KEY (gitignored)
-├── .env.example            # template, safe to commit
-├── .gitignore
-├── PROJECT_PLAN.md         # this file
-├── README.md
-├── requirements.txt
-├── data/
-│   ├── cache/               # RentCast pulls, gitignored, refreshed periodically
-│   └── priors/              # calibrated prior distributions per Bakersfield ZIP
-├── src/
-│   ├── data_layer/
-│   │   └── rentcast_client.py
-│   ├── priors/
-│   │   └── bayesian_update.py
-│   ├── simulation/
-│   │   ├── monte_carlo.py
-│   │   ├── insurance_models.py     # flat / linear / jump-scenario variants
-│   │   └── convergence.py          # adaptive iteration + variance reduction
-│   ├── decision/
-│   │   └── lsm_backward_induction.py
-│   ├── validation/
-│   │   └── challenger_models.py    # simple lattice / flat-DCF benchmark
-│   └── reporting/
-│       └── output.py               # probability-based output, not point estimates
-├── ablation/
-│   └── run_ablation.py             # the harness described in Phase 4 and 6
-└── tests/
-```
+This is a **rate-environment / negative-leverage problem**, not a property-selection or search-radius problem, and it changes near-term priorities: standard listed-inventory screening is now a low-value workflow to build more infrastructure around. Effort is redirected toward (a) forced value creation and (b) genuinely software-accessible off-market sourcing, while (c) generic data-layer hardening on standard listings is paused pending a rate move.
 
 ---
 
-## Build order (walking skeleton first — do not build sophisticated pieces before the plumbing works end to end)
+## Completed phases
 
-### Phase 1 — Walking skeleton
+### Phase 0 — Environment & repo setup ✅
+- RentCast API key collected, stored in `.env` (gitignored), loaded via `python-dotenv`.
+- Private GitHub repo under `UniversalDreams`, `bakersfield-reia`.
 
-Goal: prove the full pipeline runs end to end in its dumbest possible form.
+### Phase 1 — Walking skeleton ✅
+- Plain Monte Carlo, fixed point-estimate inputs, one property (6500 Shreveport Ct, Bakersfield): $397,000 price, $2,190/mo rent, 3.98% cap rate.
+- Result: `P(cash flow > 0, Year 1) = 0.0%` at 25% down / 7.0% financing. Median IRR 4.68%, 5th-95th pctile 0.90%-8.00%.
+- Confirmed this is a leverage/negative-spread issue, not simulation noise: cap rate is deterministically below the debt constant, so variance across paths barely matters.
 
-- Pull data for **one** Bakersfield property (or one ZIP's comps) via the RentCast client.
-- Plain Monte Carlo simulation with **fixed point-estimate inputs** (no Bayesian updating yet, no jump-scenario insurance yet): rent, vacancy, cap rate, appreciation, interest rate, flat insurance cost.
-- Output: distribution of IRR and cash flow across simulated paths, reported as `P(cash flow > 0)` and a rough IRR histogram — probability-based output from day one, not a single number.
-- No LSM yet. No buy/hold/sell timing logic yet. Just: does the simulation run, on real pulled data, and produce a sane-looking distribution?
+### Phase 1c — Breakeven cap rate function + market screen ✅
+- `src/simulation/leverage_threshold.py`: `mortgage_constant()`, `min_cap_rate_for_breakeven()`, `min_down_payment_for_target_cap_rate()`, both fully-amortizing and `interest_only` variants. Validated exactly against the Shreveport Ct sweep.
+- Market screen: 27 verifiable properties (16 SFR + 11 MF) across 93305/307/308/309/313/311/312/314. **0/27 clear ≤25% down; 0/27 clear ≤35% down** (fully amortizing, 7.0%). Best case: 415 Jeffrey St, 4.90% cap rate, needs 38.6% down. Multifamily did not outperform SFR (best MF cap rate 4.06%).
+- Interest-only @ 7.0%: 2/27 clear ≤35% down (415 Jeffrey St at 30.0%, 911 N Chester Ave at 32.0%); 0/27 clear ≤25% down.
+- Rate sensitivity sweep (fully amortizing, reusable monitor — `scripts/phase1c_sensitivity.py`, rerun monthly): 7.0%→0/27 at both thresholds; 6.5%→0/27; 6.0%→2/27 at ≤35%; 5.5%→3/27; 5.0%→1/27 at ≤25%, 4/27 at ≤35%.
+- Data-quality note: RentCast rent-AVM/value-AVM unit-count mismatches on some multifamily records were detected (bedroom-count cross-check) and excluded (5/16 MF records) rather than papered over with a fabricated heuristic.
 
-**Do not proceed to Phase 2 until Phase 1 runs cleanly on real RentCast data.**
+### Sourcing landscape research ✅ (research report, not yet built)
+Evaluated distressed/pre-foreclosure, seller-financing, subject-to, and assumable-mortgage paths for software feasibility. Verdict:
+- **Software-native, worth building:** Kern County Recorder class-search (free, real-time NOD/NOS filings — but legacy CGI, metadata-only, no APN search since AB 1785/Dec 2024) + Kern GEODAT ArcGIS parcel data (free API) to resolve owner names to APN/address.
+- **Software-native, paid, pending a subscription decision (not yet authorized to build):** PropStream (~$99/mo, has API) or ATTOM (enterprise, best API, opaque pricing) for broader pre-foreclosure/probate/absentee/high-equity lead lists.
+- **Software-searchable but deprioritized:** Assumable.io / Roam / AssumeList — real assumable-mortgage marketplaces covering CA, but the economics (equity-gap cash requirement) and typical use case (owner-occupant/house-hack) fit poorly given this project's non-owner-occupied constraint.
+- **Not software-buildable — manual/relationship legwork only, keep out of the codebase:** seller financing (no residential inventory feed exists; it's a negotiation you propose to motivated/free-and-clear owners) and subject-to deals (local wholesaler networks, REIA meetups).
 
-### Phase 2 — Data layer hardening
+---
 
-- `rentcast_client.py`: wrapper with caching (respect RentCast's free-tier call limits), a documented refresh cadence (monthly or quarterly — not real-time), and clear separation between raw API response and the cleaned fields the simulation consumes.
-- Cache pulled data to `data/cache/` so repeated runs don't burn API calls.
+## Revised build order (current priorities, supersedes the original Phase 2+ sequence)
+
+### Phase 1d — Kern Recorder NOD/NOS scraper (next)
+- `src/sourcing/kern_recorder_scraper.py`: scrape recorderonline.co.kern.ca.us class-search for document classes "Default Notice" and "Notice of Trustee's Sale," paged over a rolling date range (start: trailing 90 days). Output: grantor/grantee name, doc type, recording date, doc number. No APN search (disabled under AB 1785) — query by class + date only.
+
+### Phase 1e — Owner-to-parcel enrichment
+- `src/sourcing/geodat_enrichment.py`: pull Kern GEODAT ArcGIS parcel layer (free REST/GeoJSON), join scraper output to APN/address/assessed value by owner name.
+- Feed resolved addresses into the existing `leverage_threshold.py` screen (Phase 1c logic) using RentCast for rent/value estimates, instead of only screening standard listed inventory.
+
+### Phase 1f — BRRRR / forced-value module
+- `src/simulation/brrr_analysis.py`: accepts `rehab_cost`, `post_rehab_arv`, `post_rehab_rent`, cash-out refinance at target LTV (75%) on ARV. Outputs capital recycled, cash left in deal, post-refi `P(cash flow > 0)` and IRR (probabilistic, not point estimate).
+- Test against properties closest to clearing from the Phase 1c screen (415 Jeffrey St, 911 N Chester Ave): what rehab budget + rent/ARV uplift flips each from fail to clear.
+
+### Phase 2 — Data-layer hardening (PAUSED, conditional)
+Original scope (RentCast caching, refresh cadence for standard listings) is deprioritized — building infrastructure around standard-listing screening is low-value while the systemic negative-leverage finding holds. Resume only when the rate-sensitivity monitor (Phase 1c) shows meaningful inventory starting to clear, or if Stage 2 sourcing (below) proves distressed/off-market volume is thin and standard-listing screening becomes the primary workflow again.
+
+**Not authorized to build yet (pending explicit go-ahead):**
+- PropStream or ATTOM API integration — hold until a subscription is chosen and an API key is provided, same pattern as RentCast.
+- Assumable.io/Roam/AssumeList integration — deprioritized; revisit only if the owner-occupied constraint changes.
+- Any "seller financing search" feature — there is no real inventory to query against; do not build a placeholder for this.
 
 ### Phase 3 — Bayesian updating layer
+- As originally scoped: priors from RentCast/published Bakersfield submarket data, posterior updates as owned-property performance data accumulates. Now also a natural input point for distressed-lead conversion data once Phase 1d/1e are producing leads.
 
-- Replace fixed point estimates with priors calibrated from RentCast/published Bakersfield submarket data (per ZIP).
-- Add a posterior-update mechanism: as the user's own property performance data accumulates (starts empty), update the relevant distributions.
-- Expected behavior to verify: as synthetic "owned property" data points are added (even test fixtures at first, since the user has zero properties today), posterior variance should visibly narrow. Write a test that checks this narrowing behavior directly — it's the mechanism the user is relying on to demonstrate the model is learning, not just running static assumptions with extra steps.
-
-### Phase 4 — Insurance module + first ablation
-
-Build **three** variants, not one:
-- `flat`: constant insurance cost, year over year. This is a deliberate null baseline, not a real candidate — its only purpose is to test whether insurance modeling matters *at all* for a given deal.
-- `linear_trend`: smooth upward drift with noise.
-- `jump_scenario`: discretized compound-Poisson-style approach — 3-4 named annual states (normal / elevated / crisis year) with probabilities and cost multipliers calibrated from the 2017-2025 CA insurance/regulatory event history (reinsurance repricing, FAIR Plan assessment years). This is the realistic model — the other two exist to be compared against it, not to compete with it.
-
-Build `ablation/run_ablation.py` to run all three on the same property and report whether the buy/sell decision output changes materially between them. Two separate comparisons, not one:
-1. `flat` vs. either realistic model → does insurance modeling matter at all for this property?
-2. `linear_trend` vs. `jump_scenario` → does getting the *shape* right (smooth vs. event-driven) change the decision enough to justify the added complexity?
+### Phase 4 — Insurance module + ablation
+- As originally scoped: `flat` (null baseline) / `linear_trend` / `jump_scenario` (discretized compound-Poisson-style, calibrated on 2017-2025 CA insurance/regulatory event history) variants, with the ablation harness comparing decision-relevant outputs across all three.
 
 ### Phase 5 — Convergence and tail-risk handling
-
-- Implement adaptive iteration counts: cheap convergence monitoring (running mean/standard error) for point estimates like expected IRR.
-- Separately, handle tail metrics (5th-percentile IRR, `P(DSCR < 1)`) with either a much larger iteration budget or basic importance/conditional-tail sampling — these converge far slower than the mean and are the numbers the buy/no-buy decision actually depends on. Don't apply the same iteration count to both without checking.
-- Add a convergence-study test: run the same simulation at increasing N and confirm decision-relevant tail outputs (not just the mean) have actually stabilized before trusting them.
+- As originally scoped: adaptive iteration counts for point estimates (fast-converging); larger budget or importance/conditional-tail sampling for tail metrics (5th-percentile IRR, `P(DSCR<1)`) which converge far slower and are what the buy/no-buy decision actually depends on.
 
 ### Phase 6 — LSM / backward induction decision layer
-
-- Build on top of the Monte Carlo paths from Phase 1-5 (do not build this as a separate model — it consumes the simulated paths as its input, per Longstaff-Schwartz).
-- Solves: buy-now-vs-wait at the front end, then each simulated year, hold-vs-sell-vs-refinance, via least-squares regression backward induction.
-- Output: an optimal stopping rule, not just a static score.
+- As originally scoped: built on top of Monte Carlo paths (not a separate model), solving buy-now-vs-wait then annual hold-vs-sell-vs-refinance via least-squares regression backward induction.
 
 ### Phase 7 — Validation / challenger model
-
-- Build a deliberately simple benchmark (a 2-variable binomial lattice, or a plain deterministic DCF) that is NOT part of production but is run periodically — before any real purchase decision, or quarterly — to sanity-check the full pipeline's output.
-- If the challenger and the full pipeline disagree sharply, investigate before trusting the full model. This is a validation step, not a permanent parallel system.
+- As originally scoped: a deliberately simple benchmark (2-variable lattice or flat DCF) run periodically, not in production, to sanity-check the full pipeline before any real purchase decision.
 
 ### Phase 8 — Reporting
-
-- Output probability signals: `P(IRR ≥ target)`, `P(cash flow > 0)`, `P(DSCR < 1)`, 5th-percentile downside IRR. Never collapse this to a single point estimate in the final report.
-- Optional, later: a thin LLM layer for (a) parsing unstructured listings/disclosures into structured inputs at the front of the pipeline, and (b) drafting a readable deal-memo summary of the simulation output at the back. Keep the LLM out of the actual decision math in the middle.
+- As originally scoped: probability-based output only (`P(IRR≥target)`, `P(cash flow>0)`, `P(DSCR<1)`, 5th-percentile downside IRR) — never collapse to a single point estimate.
+- Optional LLM layer at both ends: front (parsing unstructured listings/disclosures/distressed-lead records into structured inputs) and back (deal-memo drafting). Never in the decision math itself.
 
 ---
 
 ## Explicitly excluded (do not build these)
 
-- **Reinforcement learning** — the decision frequency here (roughly 5-10 lifetime decisions) is far too sparse for RL to learn anything; it needs many episodes this problem will never generate.
-- **Monte Carlo Tree Search** — this problem has a small branching factor and an analytically tractable value function (discounted cash flow); MCTS is built for huge-branching-factor problems with no closed-form value function (games, high-frequency trading). It would also risk pruning promising branches prematurely given how few simulated rollouts per decision node this problem allows.
-- **FHA / owner-occupant financing assumptions** — the user will not live in the property; all financing logic should assume DSCR or conventional investment loans (20-25% down) only.
-- **Full continuous-time jump-diffusion for insurance** — that's cat-bond-issuer-grade precision for a portfolio of one to a few houses; the discretized compound-Poisson-style scenario model in Phase 4 is the right resolution.
+- **Reinforcement learning** — decision frequency (~5-10 lifetime decisions) is far too sparse for RL to learn anything.
+- **Monte Carlo Tree Search** — small branching factor, analytically tractable value function (discounted cash flow); MCTS is built for huge-branching-factor, no-closed-form-value problems (games, HFT), and risks premature pruning given how few rollouts per node this problem allows.
+- **FHA / owner-occupant financing assumptions** — fixed constraint, non-owner-occupied only.
+- **Full continuous-time jump-diffusion for insurance** — cat-bond-issuer-grade precision for a portfolio of one to a few houses; discretized scenario model is the right resolution.
+- **PropStream/ATTOM/BatchData integration** — until a subscription is explicitly authorized.
+- **Assumable.io/Roam/AssumeList integration** — deprioritized given the non-owner-occupied constraint.
+- **Any seller-financing "search" feature** — no structured inventory exists; this is a manual outreach workflow (Bakersfield REIA/wholesaler networks), not code.
+
+---
+
+## Standing monitors (rerun periodically, not one-off)
+
+- `scripts/phase1c_sensitivity.py` — rate-sweep + IO-vs-amortizing breakeven check across the 27-property screen. Rerun monthly, or on any meaningful rate move, to catch when Bakersfield inventory starts clearing leverage thresholds again.
 
 ---
 
 ## Definition of done for v1
 
-A single Bakersfield property, given a RentCast-pulled data snapshot, produces: a Monte Carlo-simulated distribution of outcomes with Bayesian-calibrated inputs, an insurance-scenario-aware cost model validated by ablation against simpler baselines, a buy-now-vs-wait and hold-vs-sell recommendation from the LSM decision layer, convergence-checked tail-risk metrics, and a probability-based report — cross-checked against a simple challenger model before being trusted for a real decision.
+A single Bakersfield property or distressed lead, given RentCast/GEODAT-sourced data, produces: a Monte Carlo-simulated distribution of outcomes with Bayesian-calibrated inputs, an insurance-scenario-aware cost model validated by ablation against simpler baselines, a buy-now-vs-wait and hold-vs-sell recommendation from the LSM decision layer (or a BRRRR-specific recommendation where forced value applies), convergence-checked tail-risk metrics, and a probability-based report — cross-checked against a simple challenger model before being trusted for a real decision.
